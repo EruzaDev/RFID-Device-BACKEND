@@ -9,7 +9,7 @@ from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 
-from rfid_backend.__main__ import ApiError, Handler, SCHEMA, authenticate, commit, database, preview
+from rfid_backend.__main__ import ApiError, Handler, SCHEMA, authenticate, commit, database, preview, save_state, get_state
 
 
 STUDENT = "A1B2C3D4"
@@ -81,6 +81,47 @@ class BackendTest(unittest.TestCase):
             preview(self.conn, {"mode": "borrow", "student_uid": "ABCDEF12", "item_uid": None})
         with self.assertRaisesRegex(ApiError, "Item tag"):
             preview(self.conn, {"mode": "borrow", "student_uid": STUDENT, "item_uid": "ABCDEF12"})
+
+    def test_device_state_follows_scan_sequence(self):
+        self.assertEqual(get_state(self.conn, "scanner-1")["stage"], "idle")
+        for stage in ("scan_student", "scan_item", "confirm", "success", "idle"):
+            self.assertTrue(save_state(self.conn, "scanner-1", {"mode": "return", "stage": stage})["ok"])
+            state = get_state(self.conn, "scanner-1")
+            self.assertEqual((state["mode"], state["stage"]), ("return", stage))
+            self.assertGreater(state["updated_at"], 0)
+            self.assertNotIn("student_uid", state)
+        with self.assertRaisesRegex(ApiError, "Invalid device mode or stage"):
+            save_state(self.conn, "scanner-1", {"mode": "return", "stage": "made_up"})
+        self.conn.execute("UPDATE devices SET active=0 WHERE id='scanner-1'")
+        with self.assertRaisesRegex(ApiError, "Device not found"):
+            get_state(self.conn, "scanner-1")
+
+    def test_http_state_routes(self):
+        body = {"mode": "borrow", "stage": "scan_student"}
+        raw, signed = self.signed_headers(body, path="/api/v1/state")
+
+        def handler(path):
+            request = object.__new__(Handler)
+            request.path = path
+            request.server = SimpleNamespace(db_path=str(Path(self.tmp.name) / "test.sqlite3"))
+            request.headers = Message()
+            for key, value in signed.items():
+                request.headers[key] = value
+            request.headers["Content-Length"] = str(len(raw))
+            request.rfile = io.BytesIO(raw)
+            request.wfile = io.BytesIO()
+            status = []
+            request.send_response = lambda code: status.append(code)
+            request.send_header = lambda *_: None
+            request.end_headers = lambda: None
+            return request, status
+
+        request, status = handler("/api/v1/state")
+        request.do_POST()
+        self.assertEqual((status[0], json.loads(request.wfile.getvalue())["ok"]), (200, True))
+        request, status = handler("/api/v1/state?device_id=scanner-1")
+        request.do_GET()
+        self.assertEqual((status[0], json.loads(request.wfile.getvalue())["stage"]), (200, "scan_student"))
 
     def test_http_route_uses_signed_request(self):
         body = {"mode": "borrow", "student_uid": STUDENT, "item_uid": None}

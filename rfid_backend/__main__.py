@@ -10,6 +10,7 @@ import ssl
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 
 SCHEMA = """
@@ -39,11 +40,25 @@ CREATE TABLE IF NOT EXISTS requests (
     device_id TEXT NOT NULL, request_id TEXT NOT NULL, body_hash TEXT NOT NULL,
     response TEXT NOT NULL, PRIMARY KEY(device_id, request_id)
 );
+CREATE TABLE IF NOT EXISTS device_state (
+    device_id TEXT PRIMARY KEY, mode TEXT NOT NULL, stage TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(device_id) REFERENCES devices(id)
+);
 """
 UID = re.compile(r"[0-9A-F]{8}(?:[0-9A-F]{6})?(?:[0-9A-F]{6})?\Z")
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}\Z")
 HEX32 = re.compile(r"[0-9a-f]{32}\Z")
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+STAGES = {"idle", "scan_student", "scan_item", "confirm", "success", "error"}
+STAGE_MESSAGES = {
+    "idle": "Standby Monitor",
+    "scan_student": "Tap Student ID",
+    "scan_item": "Tap Equipment Tag",
+    "confirm": "Await Confirmation",
+    "success": "Transaction Complete",
+    "error": "Transaction Not Accepted",
+}
 
 
 class ApiError(Exception):
@@ -152,6 +167,30 @@ def authenticate(conn, method, path, headers, raw):
     return device_id
 
 
+def save_state(conn, device_id, body):
+    if not isinstance(body, dict) or set(body) != {"mode", "stage"}:
+        raise ApiError(400, "bad_body", "Mode and stage are required")
+    if body["mode"] not in ("borrow", "return") or body["stage"] not in STAGES:
+        raise ApiError(400, "bad_state", "Invalid device mode or stage")
+    updated_at = int(time.time() * 1000)
+    conn.execute("INSERT INTO device_state(device_id,mode,stage,updated_at) VALUES(?,?,?,?) "
+                 "ON CONFLICT(device_id) DO UPDATE SET mode=excluded.mode,stage=excluded.stage,updated_at=excluded.updated_at",
+                 (device_id, body["mode"], body["stage"], updated_at))
+    return {"ok": True}
+
+
+def get_state(conn, device_id):
+    if not TOKEN.fullmatch(device_id):
+        raise ApiError(400, "bad_device", "Invalid device ID")
+    device = conn.execute("SELECT active FROM devices WHERE id=?", (device_id,)).fetchone()
+    if device is None or not device["active"]:
+        raise ApiError(404, "device_unknown", "Device not found")
+    row = conn.execute("SELECT mode,stage,updated_at FROM device_state WHERE device_id=?", (device_id,)).fetchone()
+    mode, stage, updated_at = (row["mode"], row["stage"], row["updated_at"]) if row else ("borrow", "idle", 0)
+    return {"device_id": device_id, "mode": mode, "stage": stage,
+            "message": STAGE_MESSAGES[stage], "updated_at": updated_at}
+
+
 class Handler(BaseHTTPRequestHandler):
     def respond(self, status, payload):
         raw = json.dumps(payload, separators=(",", ":")).encode()
@@ -159,17 +198,31 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(raw)
 
     def do_GET(self):
-        if self.path == "/api/v1/health":
+        route = urlsplit(self.path)
+        if route.path == "/api/v1/health" and not route.query:
             self.respond(200, {"ok": True})
+        elif route.path == "/api/v1/state":
+            try:
+                params = parse_qs(route.query, strict_parsing=True)
+                if set(params) != {"device_id"} or len(params["device_id"]) != 1:
+                    raise ApiError(400, "bad_device", "One device ID is required")
+                with closing(database(self.server.db_path)) as conn:
+                    self.respond(200, get_state(conn, params["device_id"][0]))
+            except (ApiError, ValueError) as exc:
+                if isinstance(exc, ApiError):
+                    self.respond(exc.status, {"ok": False, "code": exc.code, "message": exc.message})
+                else:
+                    self.respond(400, {"ok": False, "code": "bad_device", "message": "Invalid device ID"})
         else:
             self.respond(404, {"ok": False, "code": "not_found", "message": "Unknown route"})
 
     def do_POST(self):
-        if self.path not in ("/api/v1/preview", "/api/v1/commit"):
+        if self.path not in ("/api/v1/preview", "/api/v1/commit", "/api/v1/state"):
             self.respond(404, {"ok": False, "code": "not_found", "message": "Unknown route"})
             return
         try:
@@ -183,7 +236,12 @@ class Handler(BaseHTTPRequestHandler):
                     body = json.loads(raw)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     raise ApiError(400, "bad_json", "Invalid JSON") from None
-                result = preview(conn, body) if self.path.endswith("preview") else commit(conn, device_id, body)
+                if self.path.endswith("preview"):
+                    result = preview(conn, body)
+                elif self.path.endswith("commit"):
+                    result = commit(conn, device_id, body)
+                else:
+                    result = save_state(conn, device_id, body)
             self.respond(200, result)
         except ApiError as exc:
             self.respond(exc.status, {"ok": False, "code": exc.code, "message": exc.message})

@@ -64,6 +64,14 @@ The LCD shows `Input is correct` only after the backend confirms a saved record.
 
 ## API protocol
 
+### Live kiosk state
+
+The ESP32 sends a signed `POST /api/v1/state` containing only `{"mode":"borrow","stage":"scan_student"}` (or `return`). Stages are `idle`, `scan_student`, `scan_item`, `confirm`, `success`, and `error`. It reports each accepted hardware transition and resets to `idle` on cancellation or after a completed transaction. State reports are best effort and do not change loan records.
+
+The read-only display polls `GET /api/v1/state?device_id=scanner-1`. This response contains the device ID, mode, stage, a display message, and an `updated_at` Unix millisecond timestamp. It contains no student or item UID. The GET endpoint allows cross-origin browser reads; serve this API only on a network where public process status is acceptable. The page should use the same registered device ID as `DEVICE_ID` in the ESP32 configuration.
+
+`scan_student` means SCAN was pressed, `scan_item` means the student card was accepted, `confirm` means the item tag was accepted and the hardware is waiting for the confirmation button, and `success` means the commit was recorded.
+
 `POST /api/v1/preview` accepts `{"mode":"borrow","student_uid":"A1B2C3D4","item_uid":null}` after the student scan, then the same body with an item UID after the item scan. `POST /api/v1/commit` requires both UIDs and a random 32-character lowercase hex `request_id`. The server rechecks state while writing the record. `GET /api/v1/health` returns health status.
 
 Each POST includes `X-Device-Id`, `X-Timestamp` (Unix seconds), `X-Nonce` (32 lowercase hex characters), and `X-Signature` (HMAC-SHA256, lowercase hex). Calculate the HMAC with the 32-byte device secret over these UTF-8 bytes:
