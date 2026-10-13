@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.sqlite3
+*.sqlite3-*
+esp32/.pio/
+esp32/include/secrets.h
+*.pem
+*.key
+
+esp32/
