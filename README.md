@@ -1,6 +1,6 @@
 # RFID equipment borrowing with Supabase
 
-The ESP32 scans the student card and item tag, then sends HMAC-signed HTTPS requests to the `rfid-api` Supabase Edge Function. The function checks registrations and records loans in Supabase Postgres. A browser kiosk polls only the public process state; it never receives a card UID or device secret.
+The ESP32 scans the student card and item tag, then sends HMAC-signed HTTPS requests to the `rfid-api` Supabase Edge Function. The function checks registrations and records loans in Supabase Postgres. A browser kiosk subscribes to the public process state; it never receives a card UID or device secret.
 
 The project from the dashboard screenshot is `edelmgnzwcngnozaxrsx`. Its API base URL is:
 
@@ -17,7 +17,7 @@ supabase login
 supabase link --project-ref edelmgnzwcngnozaxrsx
 supabase db push --dry-run
 supabase db push
-supabase functions deploy rfid-api
+supabase functions deploy rfid-api --use-api
 ```
 
 `supabase/migrations/20261014000000_create_rfid_schema.sql` creates the tables and enables Realtime on `device_state`. `supabase/config.toml` sets `verify_jwt = false` because ESP32 requests use device HMAC credentials rather than Supabase JWTs. The function verifies each signed POST and allows public reads only for health, Realtime configuration, and process status. Supabase injects `SUPABASE_DB_URL` into the function; no database URL or privileged key belongs in the frontend or firmware. Only the non-sensitive `device_state` table grants anonymous read access. All other tables have row level security enabled without browser-facing policies.

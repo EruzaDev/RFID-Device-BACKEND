@@ -212,7 +212,9 @@ function publicConfig(origin: string): Record<string, string> {
   }
   key ??= Deno.env.get('SUPABASE_ANON_KEY')
   if (typeof key !== 'string' || !key) throw new Error('No Supabase publishable key configured')
-  return { supabase_url: origin, publishable_key: key }
+  const supabaseUrl = Deno.env.get('SUPABASE_URL') ??
+    (new URL(origin).hostname.endsWith('.supabase.co') ? origin.replace(/^http:/, 'https:') : origin)
+  return { supabase_url: supabaseUrl, publishable_key: key }
 }
 
 async function handle(request: Request): Promise<Response> {
