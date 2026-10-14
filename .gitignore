@@ -8,3 +8,5 @@ esp32/include/secrets.h
 *.key
 
 esp32/
+supabase/.temp/
+supabase/functions/.env

@@ -1,91 +1,93 @@
-# RFID borrowing and returning
+# RFID equipment borrowing with Supabase
 
-This project has a Python 3 backend and ESP32 firmware for an SPI MFRC522 reader, two buttons, an active buzzer, and a 16×2 I²C LCD. The backend records which registered student borrowed which registered item. Every ESP32 request carries a device ID, timestamp, random nonce, and HMAC-SHA256 signature. The server checks the signature, a five-minute clock window, and nonce reuse; the ESP32 verifies the server's TLS certificate.
+The ESP32 scans the student card and item tag, then sends HMAC-signed HTTPS requests to the `rfid-api` Supabase Edge Function. The function checks registrations and records loans in Supabase Postgres. A browser kiosk polls only the public process state; it never receives a card UID or device secret.
 
-## Hardware
+The project from the dashboard screenshot is `edelmgnzwcngnozaxrsx`. Its API base URL is:
 
-The included pin layout targets an ESP32 DevKit. Power the MFRC522 from **3.3 V**. Connect both buttons from their GPIO to GND; internal pull-ups are enabled. Check the voltage of your LCD backpack: many require 5 V and need a bidirectional I²C level shifter to protect ESP32 pins.
-
-| Part | ESP32 pin |
-| --- | --- |
-| MFRC522 SDA/SS | GPIO 5 |
-| MFRC522 RST | GPIO 4 |
-| MFRC522 SCK | GPIO 18 |
-| MFRC522 MISO | GPIO 19 |
-| MFRC522 MOSI | GPIO 23 |
-| LCD SDA / SCL | GPIO 21 / 22 |
-| Scan button | GPIO 25 |
-| Menu button | GPIO 26 |
-| Active buzzer signal | GPIO 27 |
-
-The LCD address is set to `0x27` in `esp32/src/main.cpp`; change it if your backpack uses `0x3F`. An active buzzer module is assumed. A bare buzzer may need a driver transistor and different signal code.
-
-## Set up the backend
-
-No Python packages are required. Run these commands from the repository root:
-
-```sh
-python3 -m rfid_backend add-student A1B2C3D4 "Alice Santos"
-python3 -m rfid_backend add-item 01020304 "Science Book"
-python3 -m rfid_backend add-device scanner-1
+```text
+https://edelmgnzwcngnozaxrsx.supabase.co/functions/v1/rfid-api
 ```
 
-The final command prints a 64-character hex secret. Copy it to the ESP32 configuration. Keep the database and firmware secrets private. To revoke a lost scanner, run `python3 -m rfid_backend disable-device scanner-1`. To reject a lost card or tag, use `disable-student UID` or `disable-item UID`. `python3 -m rfid_backend list-loans` shows records and whether each loan is open.
+## Deploy the database and function
 
-UIDs must be uppercase hexadecimal with 8, 14, or 20 characters (4, 7, or 10 bytes). The firmware prints scanned UIDs on the serial monitor if needed for registration. Use one student card and one item tag; the reader expects the student card first.
-
-The backend serves HTTPS itself. For a local network, create a certificate whose Subject Alternative Name matches the server IP (replace the sample IP):
+Install the [Supabase CLI](https://supabase.com/docs/guides/local-development/cli/getting-started), then run from this repository:
 
 ```sh
-openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 \
-  -keyout server.key -out server.pem -subj '/CN=RFID backend' \
-  -addext 'subjectAltName=IP:192.168.1.50'
-python3 -m rfid_backend serve --host 0.0.0.0 --port 8443 --cert server.pem --key server.key
+supabase login
+supabase link --project-ref edelmgnzwcngnozaxrsx
+supabase db push --dry-run
+supabase db push
+supabase functions deploy rfid-api
 ```
 
-Use a fixed LAN IP or DNS name and regenerate the certificate if it changes. With a DNS name, use `DNS:your-name` for the SAN. Place the same `server.pem` certificate in the firmware's `ROOT_CA`. Protect `server.key` and `rfid.sqlite3`; generated database files are created with owner-only permissions. Open TCP port 8443 only to your trusted network. The ESP32 needs Wi-Fi and NTP access to sign time-bound requests.
+`supabase/migrations/20261014000000_create_rfid_schema.sql` creates the tables and enables Realtime on `device_state`. `supabase/config.toml` sets `verify_jwt = false` because ESP32 requests use device HMAC credentials rather than Supabase JWTs. The function verifies each signed POST and allows public reads only for health, Realtime configuration, and process status. Supabase injects `SUPABASE_DB_URL` into the function; no database URL or privileged key belongs in the frontend or firmware. Only the non-sensitive `device_state` table grants anonymous read access. All other tables have row level security enabled without browser-facing policies.
+
+Do not deploy the function before applying the migration. If your project already has RFID tables or data, inspect `supabase db push --dry-run` first and reconcile them before applying the migration.
+
+## Enroll a scanner, student, and item
+
+Generate a unique 32-byte scanner secret locally:
+
+```sh
+python3 -c 'import secrets; print(secrets.token_hex(32))'
+```
+
+Use Supabase SQL Editor to run the following, substituting your generated secret and real scanned UIDs. Keep the secret private. UIDs must be uppercase hex with 8, 14, or 20 characters.
+
+```sql
+insert into public.devices(id, secret) values ('scanner-1', '<64 lowercase hex characters>');
+insert into public.students(uid, name) values ('A1B2C3D4', 'Alice Santos');
+insert into public.items(uid, name) values ('01020304', 'Science Book');
+```
+
+The device ID and secret must match `esp32/include/secrets.h`. Do not put the secret in a `VITE_` variable or commit it. To revoke a scanner, set `public.devices.active = false` for its ID. The old Python `add-device`, `add-student`, and `add-item` commands write to a local SQLite file and do **not** enroll anything in Supabase.
 
 ## Flash the ESP32
 
-Install [PlatformIO](https://docs.platformio.org/en/latest/core/installation/index.html). Copy `esp32/include/secrets.h.example` to `esp32/include/secrets.h` and fill in Wi-Fi, backend URL, device ID, printed secret, and full PEM certificate. Build and upload from `esp32/`:
+Install PlatformIO. Copy `esp32/include/secrets.h.example` to `esp32/include/secrets.h`, fill in Wi-Fi credentials, `API_BASE_URL`, `DEVICE_ID`, `DEVICE_SECRET_HEX`, and the trusted root CA PEM for the Supabase HTTPS endpoint. Keep TLS verification enabled. From `esp32/`:
 
 ```sh
 pio run -t upload
 pio device monitor
 ```
 
-`secrets.h` is ignored by Git. The backend URL must start with `https://` and match the certificate SAN. Never use a TLS client mode that skips certificate verification.
+The MFRC522 reader uses GPIO 5 (SS), 4 (RST), 18 (SCK), 19 (MISO), and 23 (MOSI). The LCD uses GPIO 21/22, the Scan and Menu buttons use GPIO 25/26, and the active buzzer uses GPIO 27. The reader must be powered at 3.3 V. Set the LCD address in `esp32/src/main.cpp` if it is not `0x27`.
 
-## Use the scanner
+Menu chooses BORROW or RETURN while idle. Press Scan, present the student card, present the item tag, then press Scan to confirm the displayed names. Menu cancels an unfinished session. The function rejects unknown/inactive cards and items, already borrowed items, and returns by the wrong student. A repeated confirmation request returns its original result without creating a second loan.
 
-Menu switches between **BORROW** and **RETURN** while idle. Press Scan to start. Present the student card, remove it, then present the item tag. The backend checks both registrations and whether the item can be borrowed or returned by that student. The LCD alternates the student and item names with `SCAN=OK MENU=NO`; press Scan again to record it. Menu cancels any unfinished session. The buzzer gives a short sound for accepted input and a longer sound for rejection. If the network fails during confirmation, press Scan to retry; the same request ID prevents a duplicate loan or return.
+## API
 
-The LCD shows `Input is correct` only after the backend confirms a saved record. The ESP32 never queues transactions while offline.
+All paths below are appended to the API base URL above. The logical path, such as `/api/v1/preview`, is also the path used in the signature string.
 
-## API protocol
+| Method and path | Purpose |
+| --- | --- |
+| `GET /api/v1/health` | Function health |
+| `GET /api/v1/config` | Public Supabase URL and publishable key for Realtime |
+| `GET /api/v1/state?device_id=scanner-1` | Read-only mode/stage for the kiosk |
+| `POST /api/v1/state` | Signed device process update |
+| `POST /api/v1/preview` | Signed student/item validation |
+| `POST /api/v1/commit` | Signed, idempotent loan or return |
 
-### Live kiosk state
-
-The ESP32 sends a signed `POST /api/v1/state` containing only `{"mode":"borrow","stage":"scan_student"}` (or `return`). Stages are `idle`, `scan_student`, `scan_item`, `confirm`, `success`, and `error`. It reports each accepted hardware transition and resets to `idle` on cancellation or after a completed transaction. State reports are best effort and do not change loan records.
-
-The read-only display polls `GET /api/v1/state?device_id=scanner-1`. This response contains the device ID, mode, stage, a display message, and an `updated_at` Unix millisecond timestamp. It contains no student or item UID. The GET endpoint allows cross-origin browser reads; serve this API only on a network where public process status is acceptable. The page should use the same registered device ID as `DEVICE_ID` in the ESP32 configuration.
-
-`scan_student` means SCAN was pressed, `scan_item` means the student card was accepted, `confirm` means the item tag was accepted and the hardware is waiting for the confirmation button, and `success` means the commit was recorded.
-
-`POST /api/v1/preview` accepts `{"mode":"borrow","student_uid":"A1B2C3D4","item_uid":null}` after the student scan, then the same body with an item UID after the item scan. `POST /api/v1/commit` requires both UIDs and a random 32-character lowercase hex `request_id`. The server rechecks state while writing the record. `GET /api/v1/health` returns health status.
-
-Each POST includes `X-Device-Id`, `X-Timestamp` (Unix seconds), `X-Nonce` (32 lowercase hex characters), and `X-Signature` (HMAC-SHA256, lowercase hex). Calculate the HMAC with the 32-byte device secret over these UTF-8 bytes:
+Each POST includes `X-Device-Id`, `X-Timestamp` (Unix seconds), `X-Nonce` (32 lowercase hex characters), and `X-Signature` (HMAC-SHA256 lowercase hex). Sign these UTF-8 bytes using the device's 32-byte secret:
 
 ```text
-POST\n/api/v1/preview\n<TIMESTAMP>\n<NONCE>\n<SHA256_HEX_OF_EXACT_JSON_BODY>
+POST\n<LOGICAL_PATH>\n<TIMESTAMP>\n<NONCE>\n<SHA256_HEX_OF_EXACT_JSON_BODY>
 ```
 
-Use the actual path for each request. Repeating a nonce is rejected, even with a new signature. Repeating a committed `request_id` with the same data returns the original result; changing its data is rejected.
+The clock must be within five minutes. Nonces cannot be replayed. `preview` accepts `{"mode":"borrow","student_uid":"A1B2C3D4","item_uid":null}` after the student scan, then the same body with the item UID. `commit` also requires a random 32-character lowercase hex `request_id`. `state` accepts a mode (`borrow` or `return`) and stage (`idle`, `scan_student`, `scan_item`, `confirm`, `success`, or `error`). The public state response includes no student or item UID.
 
-**Card security limit:** MFRC522 reads a card UID, which can be copied or emulated. This system verifies an enrolled UID and authenticates the ESP32, but a UID alone is not strong proof of a student's identity. If identity assurance matters, use cryptographic cards/readers and card challenge-response authentication.
+The kiosk subscribes to Postgres changes for `device_state` and refreshes state once a minute. This keeps process updates immediate without constant Edge Function polling. The `config` route returns a **publishable** Supabase key, never a privileged database key.
 
-## Tests
+## Checks
 
 ```sh
-python3 -m unittest discover -s tests -v
+deno check supabase/functions/rfid-api/index.ts
+deno lint supabase/functions/rfid-api/index.ts
+deno run -A supabase/tests/schema_test.ts
 ```
+
+**Card security limit:** MFRC522 reads a card UID, which can be copied or emulated. A registered UID and signed scanner request do not prove the cardholder's identity.
+
+## Legacy local server
+
+`rfid_backend/` and `tests/test_backend.py` remain for the earlier standalone Python/SQLite setup and its tests. They are separate from the Supabase deployment. Do not run both backends against the same scanner configuration.

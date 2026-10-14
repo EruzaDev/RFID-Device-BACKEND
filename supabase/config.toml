@@ -1,0 +1,4 @@
+project_id = "rfid-device-backend"
+
+[functions.rfid-api]
+verify_jwt = false
