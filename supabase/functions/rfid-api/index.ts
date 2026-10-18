@@ -1,3 +1,4 @@
+import { parseProcessBody, processMessages } from './process.ts'
 import postgres from 'npm:postgres@3.4.5'
 
 const databaseUrl = Deno.env.get('SUPABASE_DB_URL')
@@ -9,15 +10,6 @@ const uidPattern = /^([0-9A-F]{8}|[0-9A-F]{14}|[0-9A-F]{20})$/
 const tokenPattern = /^[A-Za-z0-9_-]{1,64}$/
 const hex32 = /^[0-9a-f]{32}$/
 const hex64 = /^[0-9a-f]{64}$/
-const stages = new Set(['idle', 'scan_student', 'scan_item', 'confirm', 'success', 'error'])
-const messages: Record<string, string> = {
-  idle: 'Standby Monitor',
-  scan_student: 'Tap Student ID',
-  scan_item: 'Tap Equipment Tag',
-  confirm: 'Await Confirmation',
-  success: 'Transaction Complete',
-  error: 'Transaction Not Accepted',
-}
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -181,24 +173,23 @@ async function getState(deviceId: string | null): Promise<Record<string, unknown
   if (!deviceId || !tokenPattern.test(deviceId)) throw new ApiError(400, 'bad_device', 'Invalid device ID')
   const devices = await sql`select id from public.devices where id = ${deviceId} and active = true`
   if (devices.length !== 1) throw new ApiError(404, 'device_unknown', 'Device not found')
-  const states = await sql`select mode, stage, updated_at from public.device_state where device_id = ${deviceId}`
+  const states = await sql`select mode, stage, error_code, updated_at from public.device_state where device_id = ${deviceId}`
   const state = states[0] ?? { mode: 'borrow', stage: 'idle', updated_at: 0 }
   return {
     device_id: deviceId, mode: state.mode, stage: state.stage,
-    message: messages[state.stage], updated_at: Number(state.updated_at),
+    message: processMessages[state.stage], error_code: state.error_code ?? null, updated_at: Number(state.updated_at),
   }
 }
 
 async function saveState(deviceId: string, body: unknown): Promise<{ ok: true }> {
-  if (!objectWithKeys(body, ['mode', 'stage'])) throw new ApiError(400, 'bad_body', 'Mode and stage are required')
-  if ((body.mode !== 'borrow' && body.mode !== 'return') || typeof body.stage !== 'string' || !stages.has(body.stage)) {
-    throw new ApiError(400, 'bad_state', 'Invalid device mode or stage')
-  }
+  const state = parseProcessBody(body)
+  if (!state) throw new ApiError(400, 'bad_state', 'Invalid process mode, stage, or error code')
   await sql`
-    insert into public.device_state(device_id, mode, stage, updated_at)
-    values (${deviceId}, ${body.mode}, ${body.stage}, ${Date.now()})
+    insert into public.device_state(device_id, mode, stage, error_code, updated_at)
+    values (${deviceId}, ${state.mode}, ${state.stage}, ${state.error_code}, ${Date.now()})
     on conflict (device_id) do update set
-      mode = excluded.mode, stage = excluded.stage, updated_at = excluded.updated_at
+      mode = excluded.mode, stage = excluded.stage, error_code = excluded.error_code,
+      updated_at = greatest(excluded.updated_at, public.device_state.updated_at + 1)
   `
   return { ok: true }
 }
